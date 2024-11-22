@@ -1,110 +1,100 @@
 import os
-import logging
-import streamlit as st
-import gdown
+from dotenv import load_dotenv
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_pinecone import PineconeVectorStore
 from langchain_groq import ChatGroq
-from langchain.schema.runnable import RunnablePassthrough, RunnableParallel
-from langchain.schema import StrOutputParser
-from langchain.vectorstores import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.prompts import ChatPromptTemplate
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import LLMChainExtractor
-
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from langchain_core.retrievers import BaseRetriever
+from langchain.schema import Document, HumanMessage, AIMessage
+from typing import List
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 
 # Load environment variables
-os.environ["GROQ_API_KEY"] = "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"
+load_dotenv()
 
-# Google Drive file ID and destination path
-file_id = 'your_google_drive_file_id'
-destination = './chroma_langchain_db.zip'
-
-def download_from_drive(file_id, destination):
-    try:
-        gdown.download(f"https://drive.google.com/drive/folders/1nE0a34uTKnMefvOuqLbBWlb-R5t_LDam?usp=sharing", destination, quiet=False)
-        os.system(f'unzip {destination} -d ./')
-        logging.info("Downloaded and extracted the vector store from Google Drive.")
-    except Exception as e:
-        logging.error(f"Failed to download from Google Drive: {e}")
-
-def load_vector_store():
-    try:
-        persist_directory = "./chroma_langchain_db"
-        embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
-        vectorstore = Chroma(persist_directory=persist_directory, embedding_function=embedding_model)
-        return vectorstore
-    except Exception as e:
-        logging.error(f"Failed to load vector store: {e}")
-        return None
-
-def create_rag_chain(vectorstore):
-    llm = ChatGroq(model="llama-3.1-70b-versatile", temperature=0.5)
+class CustomRetriever(BaseRetriever):
+    vectorstore: PineconeVectorStore
     
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 10})
-    
-    compressor = LLMChainExtractor.from_llm(llm)
-    compression_retriever = ContextualCompressionRetriever(
-        base_compressor=compressor,
-        base_retriever=retriever
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        print("\nRetrieving relevant documents...")
+        documents = self.vectorstore.similarity_search(query, k=10)
+        print(f"Retrieved {len(documents)} documents.")
+        return documents
+
+    async def _aget_relevant_documents(self, query: str) -> List[Document]:
+        raise NotImplementedError("Async retrieval not implemented")
+
+def setup_vectorstore(index_name: str) -> PineconeVectorStore:
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-mpnet-base-v2"
     )
+    return PineconeVectorStore.from_existing_index(index_name, embedding_model)
 
-    prompt_template = """You are an AI assistant tasked with providing accurate information based on the given context. Your goal is to extract relevant information and present it clearly.
+def setup_llm() -> ChatGroq:
+    return ChatGroq(model="llama-3.1-70b-versatile", temperature=0)
 
-    Context:
-    {context}
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
 
-    Question: {question}
-
-    Instructions:
-    1. Provide an answer based on the information in the given context.
-    2. If the context contains relevant information, use it to construct a clear and informative answer.
-    3. If the exact answer is not in the context but related information is present, provide that information and explain its relevance.
-    4. Quote relevant parts of the context when appropriate, using quotation marks.
-    5. If multiple sources provide relevant information, synthesize them into a coherent answer.
-
-    Answer:"""
-
-    prompt = ChatPromptTemplate.from_template(prompt_template)
-
-    def format_docs(docs):
-        return "\n\n".join(f"Document {i+1} (Source: {doc.metadata.get('source', 'Unknown')}):\n{doc.page_content}" for i, doc in enumerate(docs))
-
+def setup_rag_chain(vectorstore: PineconeVectorStore, llm: ChatGroq):
+    retriever = CustomRetriever(vectorstore=vectorstore)
+    
+    template = """You are a knowledgeable legal assistant. Answer the following query based on the provided context:
+    
+    Context: {context}
+    
+    Query: {question}
+    
+    Ensure your response is accurate and based on legal statutes, precedents, or procedures."""
+    
+    prompt = ChatPromptTemplate.from_template(template)
+    
     rag_chain = (
-        RunnableParallel(
-            {"context": compression_retriever | format_docs, "question": RunnablePassthrough()}
-        )
-        | prompt
-        | llm
+        {
+            "context": retriever | format_docs,
+            "question": RunnablePassthrough()
+        }
+        | prompt 
+        | llm 
         | StrOutputParser()
     )
     
     return rag_chain
 
 def main():
-    st.title("Legal GPT Assistant")
-    st.write("You can ask questions about the legal documents in the specified directory.")
+    print("\nInitializing Legal Assistant...")
     
-    download_from_drive(file_id, destination)
-    
-    vectorstore = load_vector_store()
-    if vectorstore is None:
-        st.error("Failed to load vector store. Exiting.")
-        return
+    try:
+        index_name = "legal-rag"
+        vectorstore = setup_vectorstore(index_name)
+        llm = setup_llm()
+        rag_chain = setup_rag_chain(vectorstore, llm)
 
-    rag_chain = create_rag_chain(vectorstore)
-
-    user_question = st.text_input("Please enter your question:")
-    
-    if user_question:
-        try:
-            # Use the RAG chain to get the answer
-            answer = rag_chain.invoke(user_question)
-            st.write("Answer:", answer)
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-            st.write("Please try asking your question again.")
+        print("\nLegal Assistant Ready. Enter your queries (type 'quit' to exit).\n")
+        
+        chat_history = []
+        while True:
+            query = input("\nEnter your legal query: ").strip()
+            if query.lower() == 'quit':
+                break
+                
+            try:
+                response = rag_chain.invoke(query)
+                
+                print("\nResponse:", response)
+                print("\n" + "="*50)
+                
+                chat_history.append(HumanMessage(content=query))
+                chat_history.append(AIMessage(content=response))
+                
+            except Exception as e:
+                print(f"\nError processing query: {str(e)}")
+                print("Please try again with a different query.")
+                
+    except Exception as e:
+        print(f"\nError initializing the Legal Assistant: {str(e)}")
+        print("Please check your environment variables and dependencies.")
 
 if __name__ == "__main__":
     main()
